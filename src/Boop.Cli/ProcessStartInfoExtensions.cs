@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Diagnostics;
 using Microsoft.DotNet.Cli.Utils;
 
 namespace Boop.Cli
@@ -7,6 +8,10 @@ namespace Boop.Cli
     {
         public static int ExecuteAndCaptureOutput(this ProcessStartInfo startInfo, out string stdOut, out string stdErr)
         {
+            var old = Console.ForegroundColor;
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine(startInfo.FileName + " " + startInfo.Arguments);
+            Console.ForegroundColor = old;
             var outStream = new StreamForwarder().Capture();
             var errStream = new StreamForwarder().Capture();
 

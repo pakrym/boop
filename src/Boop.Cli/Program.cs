@@ -9,7 +9,6 @@ using System.IO.Compression;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
-using Azure.Deployments.Core.Entities;
 using Bicep.Core.Emit;
 using Bicep.Core.FileSystem;
 using Bicep.Core.Parsing;
@@ -22,92 +21,26 @@ using Bicep.Core.Workspaces;
 
 namespace Boop.Cli
 {
-    public class Dotnet
-    {
-        public static void Run(string arguments, string workingDirectory = null)
-        {
-            if (new ProcessStartInfo("dotnet", arguments)
-            {
-                WorkingDirectory = workingDirectory
-            }.ExecuteAndCaptureOutput(out var stdOut, out var stdErr) != 0)
-            {
-                Console.Error.WriteLine("Failed to init user secrets." + stdOut + stdErr);
-                Environment.Exit(0);
-            }
-        }
-    }
-    public class AzCli
-    {
-        public static T Run<T>(string arguments)
-        {
-            if (TryRun(arguments, out var stdOut, out var stdErr))
-            {
-                Console.Error.WriteLine(stdErr);
-                return default;
-            }
-
-            return JsonSerializer.Deserialize<T>(stdOut);
-        }
-
-        public static T TryRun<T>(string arguments)
-        {
-            if (TryRun(arguments, out var stdOut, out var stdErr))
-            {
-                Console.Error.WriteLine(stdErr);
-            }
-
-            return JsonSerializer.Deserialize<T>(stdOut);
-        }
-
-        private static bool TryRun(string arguments, out string stdOut, out string stdErr)
-        {
-            var commandLine = $"/c az {arguments} -o json";
-            Console.WriteLine("cmd " + commandLine);
-            return new ProcessStartInfo("cmd",  commandLine).ExecuteAndCaptureOutput(out stdOut, out stdErr) != 0;
-        }
-
-        public static AccountInfo CheckLogin()
-        {
-            var loginInfo = Run<AccountInfo>("account show");
-            if (loginInfo == null)
-            {
-                Environment.Exit(1);
-            }
-
-            return loginInfo;
-        }
-
-
-        public record AccountInfo(string name, string id, AccountInfoUser user);
-
-        public record AccountInfoUser(string name)
-        {
-            public string ShortName => name.Split("@").First();
-        }
-    }
-
-    record RegisteredApp(ResourceSymbol Resource, string Path, RegisteredAppResourceUsage[] Uses);
-
-    record BoopEnvironment(string SubscriptionId, string Name, string UserName)
-    {
-    }
-
     class Program
     {
         static async Task<int> Main(string[] args)
         {
-            var appListCommand = new Command("list")
+            var devCommmand = new Command("dev")
             {
-                Handler = CommandHandler.Create<InvocationContext>(ic =>
+                Handler = CommandHandler.Create(() =>
                 {
-                    var model = GetSemanticModel(GetInput());
+                    var input = GetInput();
+                    var env = EnsureEnvironment();
+                    var model = DeployResources(env, input, out var resourceMap);
+
                     foreach (var app in GetApps(model))
                     {
-                        ic.Console.Out.Write(app.ToString());
+                        var settings = CollectSettings(app, resourceMap);
+                        AssignIdentity(resourceMap, app, env.UserName);
+                        SetProjectSettings(app, settings);
                     }
                 })
             };
-
 
             var deployCommand = new Command("deploy")
             {
@@ -115,36 +48,14 @@ namespace Boop.Cli
 
             deployCommand.Handler = CommandHandler.Create(() =>
             {
-                var env = ReadEnvironment();
-
-                Console.WriteLine($"Deploying to subscription {env.SubscriptionId}, resource group {env.Name}");
-
-                if (AzCli.Run<bool>($"group exists -n {env.Name} --subscription {env.SubscriptionId}") == false)
-                {
-                    AzCli.Run<object>($"group create -n {env.Name} --subscription {env.SubscriptionId} --location westus2");
-                }
-
                 var input = GetInput();
-                var model = GetSemanticModel(input);
-
-                var tempFile = Path.GetTempFileName();
-                using (var fileStream = File.Create(tempFile))
-                {
-                    new TemplateEmitter(model, "").Emit(fileStream);
-                }
-
-                var deploymentResult = AzCli.Run<JsonElement>($"deployment group create --resource-group {env.Name} --subscription {env.SubscriptionId} --template-file {tempFile}");
-
-                var resourceMap = CreateResourceMap(model, deploymentResult).ToList();
-
-                foreach (var deployedResource in resourceMap)
-                {
-                    Console.WriteLine("Deployed " + deployedResource.Resource.Name + " as " + deployedResource.Id);
-                }
+                var env = EnsureEnvironment();
+                var model = DeployResources(env, input, out var resourceMap);
 
                 foreach (var app in GetApps(model))
                 {
-                    DeployApp(env, input, app, resourceMap);
+                    var settings = CollectSettings(app, resourceMap);
+                    DeployApp(env, app, resourceMap, settings);
                 }
             });
 
@@ -164,15 +75,41 @@ namespace Boop.Cli
 
             var rootCommand = new RootCommand()
             {
-                new Command("app")
-                {
-                    appListCommand
-                },
+                devCommmand,
                 envCommand,
                 deployCommand
             };
 
             return await rootCommand.InvokeAsync(args);
+        }
+
+        private static SemanticModel DeployResources(BoopEnvironment env, string input, out List<DeployedResource> resourceMap)
+        {
+            Console.WriteLine($"Deploying to subscription {env.SubscriptionId}, resource group {env.Name}");
+
+            if (AzCli.Run<bool>($"group exists -n {env.Name} --subscription {env.SubscriptionId}") == false)
+            {
+                AzCli.Run<object>($"group create -n {env.Name} --subscription {env.SubscriptionId} --location westus2");
+            }
+
+            var model = GetSemanticModel(input);
+
+            var tempFile = Path.GetTempFileName();
+            using (var fileStream = File.Create(tempFile))
+            {
+                new TemplateEmitter(model, "").Emit(fileStream);
+            }
+
+            var deploymentResult = AzCli.Run<JsonElement>($"deployment group create --resource-group {env.Name} --subscription {env.SubscriptionId} --template-file {tempFile}");
+
+            resourceMap = CreateResourceMap(model, deploymentResult).ToList();
+
+            foreach (var deployedResource in resourceMap)
+            {
+                Console.WriteLine("Deployed " + deployedResource.Resource.Name + " as " + deployedResource.Id);
+            }
+
+            return model;
         }
 
         private static IEnumerable<DeployedResource> CreateResourceMap(SemanticModel model, JsonElement deploymentResult)
@@ -191,15 +128,11 @@ namespace Boop.Cli
             }
         }
 
-        private static void DeployApp(BoopEnvironment env, string input, RegisteredApp app, IEnumerable<DeployedResource> deployedResources)
+        private static void DeployApp(BoopEnvironment env, RegisteredApp app, IEnumerable<DeployedResource> deployedResources, Dictionary<string, string> settings)
         {
-            var appPath = Path.Combine(
-                Path.GetDirectoryName(input),
-                app.Path);
-
             var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
 
-            if (new ProcessStartInfo("dotnet", $"publish -c Release {appPath} -o {tempDir}").ExecuteAndCaptureOutput(out var stdOut, out var stdErr) != 0)
+            if (new ProcessStartInfo("dotnet", $"publish -c Release {app.Path} -o {tempDir}").ExecuteAndCaptureOutput(out var stdOut, out var stdErr) != 0)
             {
                 Console.Error.WriteLine("Failed to publish app." + stdOut + stdErr);
                 Environment.Exit(0);
@@ -210,24 +143,20 @@ namespace Boop.Cli
 
             var deployedResource = deployedResources.Single(r => r.Resource.Name == app.Resource.Name);
 
-            //AzCli.Run<object>($"role assignment create --assignee {env.UserName} --role \"website contributor\" --scope {deployedResource.Id}");
             AzCli.Run<object>($"webapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings WEBSITE_RUN_FROM_PACKAGE=1");
             AzCli.Run<object>($"webapp deployment source config-zip --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --src {destinationArchiveFileName}");
 
-            var settings = CollectSettings(app, deployedResources);
-
-            SetProjectSettings(appPath, settings);
             AssignRolesAndSettings(env, deployedResources, app, deployedResource, settings);
 
             Console.WriteLine($"{app.Path} published to {deployedResource.Id} view at http://{deployedResource.Properties.GetProperty("properties").GetProperty("hostNames")[0]}");
         }
 
-        private static void SetProjectSettings(string appPath, Dictionary<string,string> settings)
+        private static void SetProjectSettings(RegisteredApp app, Dictionary<string,string> settings)
         {
-            Dotnet.Run("user-secrets init", appPath);
+            Dotnet.Run("user-secrets init", app.Path);
             foreach (var setting in settings)
             {
-                Dotnet.Run($"user-secrets set {setting.Key} {setting.Value}", appPath);
+                Dotnet.Run($"user-secrets set {setting.Key} {setting.Value}", app.Path);
             }
         }
 
@@ -270,16 +199,8 @@ namespace Boop.Cli
         {
             Console.WriteLine("Assigning roles and settings");
             var res = AzCli.Run<WebAppIdentity>($"webapp identity assign --resource-group {env.Name} --name {appResource.Name} --subscription {env.SubscriptionId}");
-            foreach (var usage in app.Uses)
-            {
-                var deployedResource = deployedResources.Single(r => r.Resource.Name == usage.Resource.Name);
 
-                foreach (var role  in usage.Roles)
-                {
-                    AzCli.Run<object>($"role assignment create --assignee {res.principalId} --role \"{role}\" --scope {deployedResource.Id}");
-                    AzCli.Run<object>($"role assignment create --assignee {env.UserName} --role \"{role}\" --scope {deployedResource.Id}");
-                }
-            }
+            AssignIdentity(deployedResources, app, res.principalId);
 
             foreach (var setting in settings)
             {
@@ -289,10 +210,24 @@ namespace Boop.Cli
 
         }
 
+        private static void AssignIdentity(IEnumerable<DeployedResource> deployedResources, RegisteredApp app, string identity)
+        {
+            foreach (var usage in app.Uses)
+            {
+                var deployedResource = deployedResources.Single(r => r.Resource.Name == usage.Resource.Name);
+
+                foreach (var role in usage.Roles)
+                {
+                    AzCli.Run<object>($"role assignment create --assignee {identity} --role \"{role}\" --scope {deployedResource.Id}");
+                }
+            }
+        }
+
         private static BoopEnvironment EnsureEnvironment()
         {
             if (ReadEnvironment() is { } env) return env;
 
+            Console.WriteLine("You have no environment configured, let's set it up!");
             var environment = SetEnvironment();
 
             return environment;
@@ -373,7 +308,10 @@ namespace Boop.Cli
 
                     if (appResource != null && path != null)
                     {
-                        yield return new RegisteredApp(appResource, path, uses.ToArray());
+                        var appPath = Path.Combine(
+                            Path.GetDirectoryName(model.Root.FileUri.AbsolutePath),
+                            path);
+                        yield return new RegisteredApp(appResource, appPath, uses.ToArray());
                     }
                 }
             }
@@ -524,4 +462,8 @@ namespace Boop.Cli
     internal record RegisteredAppResourceUsage(ResourceSymbol Resource, string[] Roles);
 
     internal record WebAppIdentity(string principalId);
+
+    internal record RegisteredApp(ResourceSymbol Resource, string Path, RegisteredAppResourceUsage[] Uses);
+
+    internal record BoopEnvironment(string SubscriptionId, string Name, string UserName);
 }
