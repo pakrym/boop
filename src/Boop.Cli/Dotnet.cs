@@ -3,16 +3,16 @@ using System.Diagnostics;
 
 namespace Boop.Cli
 {
-    public class Dotnet
+    public class Exec
     {
-        public static void Run(string arguments, string workingDirectory = null)
+        public static void Run(string process, string arguments, string workingDirectory = null)
         {
-            if (new ProcessStartInfo("dotnet", arguments)
+            if (new ProcessStartInfo(process, arguments)
             {
                 WorkingDirectory = workingDirectory
             }.ExecuteAndCaptureOutput(out var stdOut, out var stdErr) != 0)
             {
-                Console.Error.WriteLine("Failed to init user secrets." + stdOut + stdErr);
+                Console.Error.WriteLine($"Failed to run {process} {arguments}. {stdOut}{stdErr}");
                 Environment.Exit(0);
             }
         }

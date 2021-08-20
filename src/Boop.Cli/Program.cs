@@ -8,6 +8,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Bicep.Core.Emit;
 using Bicep.Core.FileSystem;
@@ -18,6 +19,9 @@ using Bicep.Core.Syntax;
 using Bicep.Core.TypeSystem;
 using Bicep.Core.TypeSystem.Az;
 using Bicep.Core.Workspaces;
+using Microsoft.Tye;
+using Microsoft.Tye.ConfigModel;
+using Microsoft.Tye.Hosting;
 
 namespace Boop.Cli
 {
@@ -36,9 +40,81 @@ namespace Boop.Cli
                     foreach (var app in GetApps(model))
                     {
                         var settings = CollectSettings(app, resourceMap);
-                        AssignIdentity(resourceMap, app, env.UserName);
+                        AssignIdentity(resourceMap, app, env.UserName, false);
                         SetProjectSettings(app, settings);
                     }
+                })
+            };
+
+            var runCommand = new Command("run")
+            {
+                Handler = CommandHandler.Create<RunCommandArguments>(async args =>
+                {
+                    var input = GetInput();
+
+                    var output = new OutputContext(args.Console, args.Verbosity);
+
+                    output.WriteInfoLine("Loading Application Details...");
+
+                    var filter = ApplicationFactoryFilter.GetApplicationFactoryFilter(args.Tags);
+
+                    var model = GetSemanticModel(input);
+
+                    ConfigApplication app = new ConfigApplication
+                    {
+                        Name = Path.GetFileNameWithoutExtension(input).ToLower(),
+                        Source = new FileInfo(input)
+                    };
+
+                    var apps = GetApps(model);
+
+                    foreach (var modelApp in apps)
+                    {
+                        var service = new ConfigService()
+                        {
+                            Name = Path.GetFileNameWithoutExtension(modelApp.Path).ToLower()
+                        };
+
+                        if (modelApp.IsFunction)
+                        {
+                            service.AzureFunction = Path.GetDirectoryName(modelApp.Path);
+                        }
+                        else
+                        {
+                            service.Project = modelApp.Path;
+                        }
+                        app.Services.Add(service);
+                    }
+
+                    var application = await ApplicationFactory.CreateAsync(output, new FileInfo(input), app, args.Framework, filter);
+                    if (application.Services.Count == 0)
+                    {
+                        throw new CommandException($"No services found in \"{application.Source.Name}\"");
+                    }
+
+                    var options = new HostOptions()
+                    {
+                        Dashboard = args.Dashboard,
+                        Docker = args.Docker,
+                        NoBuild = args.NoBuild,
+                        Port = args.Port,
+
+                        // parsed later by the diagnostics code
+                        DistributedTraceProvider = args.Dtrace,
+                        LoggingProvider = args.Logs,
+                        MetricsProvider = args.Metrics,
+                        LogVerbosity = args.Verbosity,
+                        Watch = args.Watch
+                    };
+                    options.Debug.AddRange(args.Debug);
+
+                    InitializeThreadPoolSettings(application.Services.Count);
+
+                    output.WriteInfoLine("Launching Tye Host...");
+                    output.WriteInfoLine(string.Empty);
+
+                    await using var host = new TyeHost(application.ToHostingApplication(), options);
+                    await host.RunAsync();
                 })
             };
 
@@ -77,7 +153,8 @@ namespace Boop.Cli
             {
                 devCommmand,
                 envCommand,
-                deployCommand
+                deployCommand,
+                runCommand
             };
 
             return await rootCommand.InvokeAsync(args);
@@ -116,6 +193,8 @@ namespace Boop.Cli
         {
             foreach (var resourceMetadata in model.AllResources)
             {
+                if (resourceMetadata.Parent != null) continue;
+
                 var prop = deploymentResult.GetProperty("properties").GetProperty("outputs").GetProperty("_" + resourceMetadata.Symbol.Name).GetProperty("value");
                 var id = prop.GetProperty("resourceId").GetString();
                 var sid = prop.GetProperty("subscriptionId").GetString();
@@ -153,10 +232,21 @@ namespace Boop.Cli
 
         private static void SetProjectSettings(RegisteredApp app, Dictionary<string,string> settings)
         {
-            Dotnet.Run("user-secrets init", app.Path);
-            foreach (var setting in settings)
+            var workingDirectory = Path.GetDirectoryName(app.Path);
+            if (app.IsFunction)
             {
-                Dotnet.Run($"user-secrets set {setting.Key} {setting.Value}", app.Path);
+                foreach (var setting in settings)
+                {
+                    Exec.Run("func", $"settings add {setting.Key.Replace(":", "__")} {setting.Value}", workingDirectory);
+                }
+            }
+            else
+            {
+                Exec.Run("dotnet", "user-secrets init", workingDirectory);
+                foreach (var setting in settings)
+                {
+                    Exec.Run("dotnet", $"user-secrets set {setting.Key} {setting.Value}", workingDirectory);
+                }
             }
         }
 
@@ -184,6 +274,11 @@ namespace Boop.Cli
                             deployedResource.Properties.GetProperty("properties").GetProperty("vaultUri").GetString());
                         break;
 
+                    case "Microsoft.ServiceBus/namespaces":
+                        settings.Add($"{deployedResource.Resource.Name}:fullyQualifiedNamespace",
+                            new Uri(deployedResource.Properties.GetProperty("properties").GetProperty("serviceBusEndpoint").GetString()).Host);
+                        break;
+
                 }
             }
 
@@ -200,7 +295,7 @@ namespace Boop.Cli
             Console.WriteLine("Assigning roles and settings");
             var res = AzCli.Run<WebAppIdentity>($"webapp identity assign --resource-group {env.Name} --name {appResource.Name} --subscription {env.SubscriptionId}");
 
-            AssignIdentity(deployedResources, app, res.principalId);
+            AssignIdentity(deployedResources, app, res.principalId, true);
 
             foreach (var setting in settings)
             {
@@ -210,7 +305,7 @@ namespace Boop.Cli
 
         }
 
-        private static void AssignIdentity(IEnumerable<DeployedResource> deployedResources, RegisteredApp app, string identity)
+        private static void AssignIdentity(IEnumerable<DeployedResource> deployedResources, RegisteredApp app, string identity, bool isServicePrincipal)
         {
             foreach (var usage in app.Uses)
             {
@@ -218,7 +313,8 @@ namespace Boop.Cli
 
                 foreach (var role in usage.Roles)
                 {
-                    AzCli.Run<object>($"role assignment create --assignee {identity} --role \"{role}\" --scope {deployedResource.Id}");
+                    var assigneeParameter = isServicePrincipal ? $"--assignee-object-id {identity} --assignee-principal-type ServicePrincipal" : $"--assignee {identity}";
+                    AzCli.Run<object>($"role assignment create {assigneeParameter} --role \"{role}\" --scope {deployedResource.Id}");
                 }
             }
         }
@@ -308,10 +404,13 @@ namespace Boop.Cli
 
                     if (appResource != null && path != null)
                     {
+                        var isFunction = ((ObjectSyntax)appResource.DeclaringResource.Value).SafeGetPropertyByName("kind")?.Value is StringSyntax stringSyntax &&
+                                         stringSyntax.TryGetLiteralValue()?.StartsWith("function") is true;
+
                         var appPath = Path.Combine(
                             Path.GetDirectoryName(model.Root.FileUri.AbsolutePath),
                             path);
-                        yield return new RegisteredApp(appResource, appPath, uses.ToArray());
+                        yield return new RegisteredApp(appResource, appPath, isFunction, uses.ToArray());
                     }
                 }
             }
@@ -347,7 +446,7 @@ namespace Boop.Cli
             {
                 foreach (var diagnostic in diagnostics)
                 {
-                    Console.Error.WriteLine($"{bicepFile.FileUri}, {diagnostic.Message}, {bicepFile.LineStarts}");
+                    Console.Error.WriteLine($"{bicepFile.FileUri}, {diagnostic.Message}, {string.Join(",", diagnostic.Span)}");
                 }
             }
 
@@ -377,6 +476,8 @@ namespace Boop.Cli
 
                 foreach (var resource in _semanticModel.AllResources)
                 {
+                    if (resource.Parent != null) continue;
+
                     var identifierName = resource.Symbol.Name;
                     children.Add(new OutputDeclarationSyntax(
                         Array.Empty<SyntaxBase>(),
@@ -404,14 +505,17 @@ namespace Boop.Cli
 
             protected override SyntaxBase ReplaceResourceDeclarationSyntax(ResourceDeclarationSyntax syntax)
             {
+                var orig = syntax;
+                syntax = (ResourceDeclarationSyntax)base.ReplaceResourceDeclarationSyntax(syntax);
+
                 bool needsLocation = false;
                 bool needsName = false;
 
-                var symbol =  _semanticModel.Binder.GetSymbolInfo(syntax);
+                var symbol =  _semanticModel.Binder.GetSymbolInfo(orig);
                 if (symbol is ResourceSymbol { Type: ResourceType { Body: ObjectType objectType}} )
                 {
-                    needsLocation = objectType.Properties.ContainsKey("location");
-                    needsName = objectType.Properties.ContainsKey("name");
+                    needsLocation = objectType.Properties.TryGetValue("location", out var locationProperty) && (locationProperty.Flags & TypePropertyFlags.FallbackProperty) == 0;
+                    needsName = objectType.Properties.TryGetValue("name", out var nameProperty) && (nameProperty.Flags & TypePropertyFlags.FallbackProperty) == 0;
                 }
 
                 if (syntax.Value is ObjectSyntax objectSyntax)
@@ -452,10 +556,58 @@ namespace Boop.Cli
                     );
                 }
 
-                return base.ReplaceResourceDeclarationSyntax(syntax);
+                return syntax;
             }
         }
+        private static void InitializeThreadPoolSettings(int serviceCount)
+        {
+            ThreadPool.GetMinThreads(out var workerThreads, out var completionPortThreads);
+
+            // We need to bump up the min threads to something reasonable so that the dashboard doesn't take forever
+            // to serve requests. All console IO is blocking in .NET so capturing stdoutput and stderror results in blocking thread pool threads.
+            // The thread pool handles bursts poorly and HTTP requests end up getting stuck behind spinning up docker containers and processes.
+
+            // Bumping the min threads doesn't mean we'll have min threads to start, it just means don't add a threads very slowly up to
+            // min threads
+            ThreadPool.SetMinThreads(Math.Max(workerThreads, serviceCount * 4), completionPortThreads);
+
+            // We use serviceCount * 4 because we currently launch multiple processes per service, this gives the dashboard some breathing room
+        }
+
+        // We have too many options to use the lambda form with each option as a parameter.
+        // This is slightly cleaner anyway.
+        private class RunCommandArguments
+        {
+            public IConsole Console { get; set; } = default!;
+
+            public bool Dashboard { get; set; }
+
+            public string[] Debug { get; set; } = Array.Empty<string>();
+
+            public string Dtrace { get; set; } = default!;
+
+            public bool Docker { get; set; }
+
+            public string Logs { get; set; } = default!;
+
+            public string Metrics { get; set; } = default!;
+
+            public bool NoBuild { get; set; }
+
+            public FileInfo Path { get; set; } = default!;
+
+            public int? Port { get; set; }
+
+            public Verbosity Verbosity { get; set; } = Verbosity.Info;
+
+            public bool Watch { get; set; }
+
+            public string Framework { get; set; } = default!;
+
+            public string[] Tags { get; set; } = Array.Empty<string>();
+        }
     }
+
 
     internal record DeployedResource(ResourceSymbol Resource, string Id, string Name, JsonElement Properties);
 
@@ -463,7 +615,7 @@ namespace Boop.Cli
 
     internal record WebAppIdentity(string principalId);
 
-    internal record RegisteredApp(ResourceSymbol Resource, string Path, RegisteredAppResourceUsage[] Uses);
+    internal record RegisteredApp(ResourceSymbol Resource, string Path, bool IsFunction, RegisteredAppResourceUsage[] Uses);
 
     internal record BoopEnvironment(string SubscriptionId, string Name, string UserName);
 }

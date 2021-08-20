@@ -7,6 +7,16 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Boop.Cli", "Boop.Cli\Boop.C
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bicep.Core", "..\..\bicep\src\Bicep.Core\Bicep.Core.csproj", "{E307AB3B-CFE9-43F0-AC4B-EA9AF0A6B015}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Microsoft.Tye.Core", "..\..\tye\src\Microsoft.Tye.Core\Microsoft.Tye.Core.csproj", "{71350E5B-7D64-481B-9DB3-31F309A3F72F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Microsoft.Tye.Hosting", "..\..\tye\src\Microsoft.Tye.Hosting\Microsoft.Tye.Hosting.csproj", "{F1A90757-BE36-4390-A5A8-D38364BCA9F1}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Microsoft.Tye.Proxy", "..\..\tye\src\Microsoft.Tye.Proxy\Microsoft.Tye.Proxy.csproj", "{2583638F-77F7-4956-A43C-43E64FD6F066}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Microsoft.Tye.Hosting.Diagnostics", "..\..\tye\src\Microsoft.Tye.Hosting.Diagnostics\Microsoft.Tye.Hosting.Diagnostics.csproj", "{2E36EAF0-DEB7-4892-973B-1911484E915F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Microsoft.Tye.Hosting.Runtime", "..\..\tye\src\Microsoft.Tye.Hosting.Runtime\Microsoft.Tye.Hosting.Runtime.csproj", "{6EEDF820-BB8A-42B0-9718-F7B8160DE8A4}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -24,5 +34,25 @@ Global
 		{E307AB3B-CFE9-43F0-AC4B-EA9AF0A6B015}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{E307AB3B-CFE9-43F0-AC4B-EA9AF0A6B015}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{E307AB3B-CFE9-43F0-AC4B-EA9AF0A6B015}.Release|Any CPU.Build.0 = Release|Any CPU
+		{71350E5B-7D64-481B-9DB3-31F309A3F72F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{71350E5B-7D64-481B-9DB3-31F309A3F72F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{71350E5B-7D64-481B-9DB3-31F309A3F72F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{71350E5B-7D64-481B-9DB3-31F309A3F72F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F1A90757-BE36-4390-A5A8-D38364BCA9F1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F1A90757-BE36-4390-A5A8-D38364BCA9F1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F1A90757-BE36-4390-A5A8-D38364BCA9F1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F1A90757-BE36-4390-A5A8-D38364BCA9F1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2583638F-77F7-4956-A43C-43E64FD6F066}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2583638F-77F7-4956-A43C-43E64FD6F066}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2583638F-77F7-4956-A43C-43E64FD6F066}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2583638F-77F7-4956-A43C-43E64FD6F066}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2E36EAF0-DEB7-4892-973B-1911484E915F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2E36EAF0-DEB7-4892-973B-1911484E915F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2E36EAF0-DEB7-4892-973B-1911484E915F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2E36EAF0-DEB7-4892-973B-1911484E915F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6EEDF820-BB8A-42B0-9718-F7B8160DE8A4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6EEDF820-BB8A-42B0-9718-F7B8160DE8A4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6EEDF820-BB8A-42B0-9718-F7B8160DE8A4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6EEDF820-BB8A-42B0-9718-F7B8160DE8A4}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
