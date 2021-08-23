@@ -5,7 +5,7 @@ namespace Boop.Cli
 {
     public class Exec
     {
-        public static void Run(string process, string arguments, string workingDirectory = null)
+        public static string Run(string process, string arguments, string workingDirectory = null)
         {
             if (new ProcessStartInfo(process, arguments)
             {
@@ -15,6 +15,8 @@ namespace Boop.Cli
                 Console.Error.WriteLine($"Failed to run {process} {arguments}. {stdOut}{stdErr}");
                 Environment.Exit(0);
             }
+
+            return stdOut;
         }
     }
 }

@@ -22,6 +22,7 @@ using Bicep.Core.Workspaces;
 using Microsoft.Tye;
 using Microsoft.Tye.ConfigModel;
 using Microsoft.Tye.Hosting;
+using Microsoft.Tye.Hosting.Dashboard;
 
 namespace Boop.Cli
 {
@@ -72,12 +73,21 @@ namespace Boop.Cli
                     {
                         var service = new ConfigService()
                         {
-                            Name = Path.GetFileNameWithoutExtension(modelApp.Path).ToLower()
+                            Name = modelApp.Name
                         };
 
                         if (modelApp.IsFunction)
                         {
                             service.AzureFunction = Path.GetDirectoryName(modelApp.Path);
+                        }
+                        else if (modelApp.IsDocker)
+                        {
+                            service.DockerFile = modelApp.Path;
+                            service.Bindings.Add(new ConfigServiceBinding()
+                            {
+                                Protocol = "http",
+                                ContainerPort = 80
+                            });
                         }
                         else
                         {
@@ -166,7 +176,7 @@ namespace Boop.Cli
 
             if (AzCli.Run<bool>($"group exists -n {env.Name} --subscription {env.SubscriptionId}") == false)
             {
-                AzCli.Run<object>($"group create -n {env.Name} --subscription {env.SubscriptionId} --location westus2");
+                AzCli.Run($"group create -n {env.Name} --subscription {env.SubscriptionId} --location westus2");
             }
 
             var model = GetSemanticModel(input);
@@ -209,25 +219,59 @@ namespace Boop.Cli
 
         private static void DeployApp(BoopEnvironment env, RegisteredApp app, IEnumerable<DeployedResource> deployedResources, Dictionary<string, string> settings)
         {
-            var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
-
-            if (new ProcessStartInfo("dotnet", $"publish -c Release {app.Path} -o {tempDir}").ExecuteAndCaptureOutput(out var stdOut, out var stdErr) != 0)
-            {
-                Console.Error.WriteLine("Failed to publish app." + stdOut + stdErr);
-                Environment.Exit(0);
-            }
-
-            var destinationArchiveFileName = Path.GetTempFileName() + ".zip";
-            ZipFile.CreateFromDirectory(tempDir, destinationArchiveFileName);
-
             var deployedResource = deployedResources.Single(r => r.Resource.Name == app.Resource.Name);
+            if (app.IsDocker)
+            {
+                var workingDirectory = Path.GetDirectoryName(app.Path);
+                var registry = GetRegistry(deployedResources, out bool isAcr);
+                if (isAcr)
+                {
+                    AzCli.Run($"acr login -n {registry}");
+                }
 
-            AzCli.Run<object>($"webapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings WEBSITE_RUN_FROM_PACKAGE=1");
-            AzCli.Run<object>($"webapp deployment source config-zip --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --src {destinationArchiveFileName}");
+                var imageName = $"{registry}/{app.Name.ToLowerInvariant()}";
+                var tag = "latest";
+
+                Exec.Run("docker", $"build {workingDirectory} -f {app.Path} -t {imageName}:{tag}");
+                Exec.Run("docker", $"push {imageName}:{tag}");
+                AzCli.Run(
+                    $"webapp config container set " +
+                    $"--resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} " +
+                    $"--docker-custom-image-name {imageName}:{tag} " +
+                    $"--docker-registry-server-url https://{registry}");
+            }
+            else
+            {
+                var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+
+                Exec.Run("dotnet", $"publish -c Release {app.Path} -o {tempDir}");
+
+                var destinationArchiveFileName = Path.GetTempFileName() + ".zip";
+                ZipFile.CreateFromDirectory(tempDir, destinationArchiveFileName);
+
+                AzCli.Run($"webapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings WEBSITE_RUN_FROM_PACKAGE=1");
+                AzCli.Run($"webapp deployment source config-zip --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --src {destinationArchiveFileName}");
+            }
 
             AssignRolesAndSettings(env, deployedResources, app, deployedResource, settings);
 
             Console.WriteLine($"{app.Path} published to {deployedResource.Id} view at http://{deployedResource.Properties.GetProperty("properties").GetProperty("hostNames")[0]}");
+        }
+
+        private static string GetRegistry(IEnumerable<DeployedResource> deployedResources, out bool isAcr)
+        {
+            isAcr = true;
+
+            foreach (var deployedResource in deployedResources)
+            {
+                var resourceType = ((ResourceType)deployedResource.Resource.Type);
+                if (resourceType.TypeReference.FullyQualifiedType == "Microsoft.ContainerRegistry/registries")
+                {
+                    return deployedResource.Properties.GetProperty("properties").GetProperty("loginServer").GetString();
+                }
+            }
+
+            throw new InvalidOperationException("Expected Microsoft.ContainerRegistry/registries resource defined as part of the deployment file");
         }
 
         private static void SetProjectSettings(RegisteredApp app, Dictionary<string,string> settings)
@@ -239,6 +283,11 @@ namespace Boop.Cli
                 {
                     Exec.Run("func", $"settings add {setting.Key.Replace(":", "__")} {setting.Value}", workingDirectory);
                 }
+            }
+            else if (app.IsDocker)
+            {
+                var envFile = Path.Combine(workingDirectory, ".boop.env");
+                File.WriteAllLines(envFile, settings.Select(s => $"{s.Key.Replace(":", "__")}={s.Value}"));
             }
             else
             {
@@ -279,6 +328,10 @@ namespace Boop.Cli
                             new Uri(deployedResource.Properties.GetProperty("properties").GetProperty("serviceBusEndpoint").GetString()).Host);
                         break;
 
+                    case "Microsoft.Web/sites":
+                        settings.Add($"{deployedResource.Resource.Name}:baseUrl",
+                            deployedResource.Properties.GetProperty("properties").GetProperty("hostNames")[0].GetString());
+                        break;
                 }
             }
 
@@ -300,9 +353,8 @@ namespace Boop.Cli
             foreach (var setting in settings)
             {
                 var key = setting.Key.Replace(":", "__");
-                AzCli.Run<object>($"webapp config appsettings set --resource-group {env.Name} --name {appResource.Name} --subscription {env.SubscriptionId} --settings {key}={setting.Value}");
+                AzCli.Run($"webapp config appsettings set --resource-group {env.Name} --name {appResource.Name} --subscription {env.SubscriptionId} --settings {key}={setting.Value}");
             }
-
         }
 
         private static void AssignIdentity(IEnumerable<DeployedResource> deployedResources, RegisteredApp app, string identity, bool isServicePrincipal)
@@ -314,7 +366,7 @@ namespace Boop.Cli
                 foreach (var role in usage.Roles)
                 {
                     var assigneeParameter = isServicePrincipal ? $"--assignee-object-id {identity} --assignee-principal-type ServicePrincipal" : $"--assignee {identity}";
-                    AzCli.Run<object>($"role assignment create {assigneeParameter} --role \"{role}\" --scope {deployedResource.Id}");
+                    AzCli.Run($"role assignment create {assigneeParameter} --role \"{role}\" --scope {deployedResource.Id}");
                 }
             }
         }
@@ -407,10 +459,14 @@ namespace Boop.Cli
                         var isFunction = ((ObjectSyntax)appResource.DeclaringResource.Value).SafeGetPropertyByName("kind")?.Value is StringSyntax stringSyntax &&
                                          stringSyntax.TryGetLiteralValue()?.StartsWith("function") is true;
 
+                        var isDocker = Path.GetFileName(path) == "Dockerfile";
+
                         var appPath = Path.Combine(
                             Path.GetDirectoryName(model.Root.FileUri.AbsolutePath),
                             path);
-                        yield return new RegisteredApp(appResource, appPath, isFunction, uses.ToArray());
+
+                        var name = appResource.Name.ToLower();
+                        yield return new RegisteredApp(appResource, name, appPath, isFunction, isDocker, uses.ToArray());
                     }
                 }
             }
@@ -615,7 +671,7 @@ namespace Boop.Cli
 
     internal record WebAppIdentity(string principalId);
 
-    internal record RegisteredApp(ResourceSymbol Resource, string Path, bool IsFunction, RegisteredAppResourceUsage[] Uses);
+    internal record RegisteredApp(ResourceSymbol Resource, string Name, string Path, bool IsFunction, bool IsDocker, RegisteredAppResourceUsage[] Uses);
 
     internal record BoopEnvironment(string SubscriptionId, string Name, string UserName);
 }

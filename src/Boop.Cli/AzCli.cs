@@ -9,13 +9,20 @@ namespace Boop.Cli
     {
         public static T Run<T>(string arguments)
         {
+            var stdOut = Run(arguments);
+
+            return JsonSerializer.Deserialize<T>(stdOut);
+        }
+
+        public static string Run(string arguments)
+        {
             if (TryRun(arguments, out var stdOut, out var stdErr))
             {
                 Console.Error.WriteLine(stdErr);
                 Environment.Exit(0);
             }
 
-            return JsonSerializer.Deserialize<T>(stdOut);
+            return stdOut;
         }
 
         public static T TryRun<T>(string arguments)
