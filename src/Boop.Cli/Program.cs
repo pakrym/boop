@@ -130,20 +130,19 @@ namespace Boop.Cli
 
             var deployCommand = new Command("deploy")
             {
-            };
-
-            deployCommand.Handler = CommandHandler.Create(() =>
-            {
-                var input = GetInput();
-                var env = EnsureEnvironment();
-                var model = DeployResources(env, input, out var resourceMap);
-
-                foreach (var app in GetApps(model))
+                Handler = CommandHandler.Create(() =>
                 {
-                    var settings = CollectSettings(app, resourceMap);
-                    DeployApp(env, app, resourceMap, settings);
-                }
-            });
+                    var input = GetInput();
+                    var env = EnsureEnvironment();
+                    var model = DeployResources(env, input, out var resourceMap);
+
+                    foreach (var app in GetApps(model))
+                    {
+                        var settings = CollectSettings(app, resourceMap);
+                        DeployApp(env, app, resourceMap, settings);
+                    }
+                })
+            };
 
             var envCommand = new Command("env")
             {
@@ -249,8 +248,17 @@ namespace Boop.Cli
                 var destinationArchiveFileName = Path.GetTempFileName() + ".zip";
                 ZipFile.CreateFromDirectory(tempDir, destinationArchiveFileName);
 
-                AzCli.Run($"webapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings WEBSITE_RUN_FROM_PACKAGE=1");
-                AzCli.Run($"webapp deployment source config-zip --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --src {destinationArchiveFileName}");
+                if (app.IsFunction)
+                {
+                     AzCli.Run($"functionapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings WEBSITE_RUN_FROM_PACKAGE=1");
+                     AzCli.Run($"functionapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings FUNCTIONS_EXTENSION_VERSION=~3");
+                     AzCli.Run($"functionapp deployment source config-zip --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --src {destinationArchiveFileName}");
+                }
+                else
+                {
+                    AzCli.Run($"webapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings WEBSITE_RUN_FROM_PACKAGE=1");
+                    AzCli.Run($"webapp deployment source config-zip --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --src {destinationArchiveFileName}");
+                }
             }
 
             AssignRolesAndSettings(env, deployedResources, app, deployedResource, settings);
@@ -330,7 +338,7 @@ namespace Boop.Cli
 
                     case "Microsoft.Web/sites":
                         settings.Add($"{deployedResource.Resource.Name}:baseUrl",
-                            deployedResource.Properties.GetProperty("properties").GetProperty("hostNames")[0].GetString());
+                            "http://" + deployedResource.Properties.GetProperty("properties").GetProperty("hostNames")[0].GetString());
                         break;
                 }
             }
@@ -445,7 +453,7 @@ namespace Boop.Cli
                         {
                             var arguments = decoratorSyntax.Arguments.ToList();
                             var name  = (arguments[0].Expression as VariableAccessSyntax).Name.IdentifierName;
-                            string[] roles = null;
+                            string[] roles = Array.Empty<string>();
                             if (arguments.Count > 1)
                             {
                                 roles = (arguments[1].Expression as StringSyntax).TryGetLiteralValue().Split(",");
