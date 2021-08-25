@@ -10,9 +10,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\..\bicep\src\Bicep.Core\Bicep.Core.csproj" />
-    <ProjectReference Include="..\..\..\tye\src\Microsoft.Tye.Core\Microsoft.Tye.Core.csproj" />
-    <ProjectReference Include="..\..\..\tye\src\Microsoft.Tye.Hosting\Microsoft.Tye.Hosting.csproj" />
+    <ProjectReference Include="..\..\bicep\src\Bicep.Core\Bicep.Core.csproj" />
+    <ProjectReference Include="..\..\tye\src\Microsoft.Tye.Core\Microsoft.Tye.Core.csproj" />
+    <ProjectReference Include="..\..\tye\src\Microsoft.Tye.Hosting\Microsoft.Tye.Hosting.csproj" />
   </ItemGroup>
 
   <ItemGroup>

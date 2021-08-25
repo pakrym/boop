@@ -1,0 +1,7 @@
+[submodule "tye"]
+	path = tye
+	url = git@github.com:pakrym/tye.git
+[submodule "bicep"]
+	path = bicep
+	url = git@github.com:pakrym/bicep.git
+	branch = pakrym/boop
