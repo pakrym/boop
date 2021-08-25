@@ -250,8 +250,7 @@ namespace Boop.Cli
 
                 if (app.IsFunction)
                 {
-                     AzCli.Run($"functionapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings WEBSITE_RUN_FROM_PACKAGE=1");
-                     AzCli.Run($"functionapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings FUNCTIONS_EXTENSION_VERSION=~3");
+                     AzCli.Run($"functionapp config appsettings set --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --settings WEBSITE_RUN_FROM_PACKAGE=1 FUNCTIONS_EXTENSION_VERSION=~3");
                      AzCli.Run($"functionapp deployment source config-zip --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId} --src {destinationArchiveFileName}");
                 }
                 else
@@ -358,10 +357,16 @@ namespace Boop.Cli
 
             AssignIdentity(deployedResources, app, res.principalId, true);
 
+            string settingsText = "";
             foreach (var setting in settings)
             {
                 var key = setting.Key.Replace(":", "__");
-                AzCli.Run($"webapp config appsettings set --resource-group {env.Name} --name {appResource.Name} --subscription {env.SubscriptionId} --settings {key}={setting.Value}");
+                settingsText += $" {key}={setting.Value}";
+            }
+
+            if (!string.IsNullOrWhiteSpace(settingsText))
+            {
+                AzCli.Run($"webapp config appsettings set --resource-group {env.Name} --name {appResource.Name} --subscription {env.SubscriptionId} --settings {settingsText}");
             }
         }
 
