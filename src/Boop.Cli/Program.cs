@@ -3,17 +3,18 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.CommandLine;
 using System.CommandLine.Invocation;
-using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Bicep.Core;
 using Bicep.Core.Emit;
 using Bicep.Core.FileSystem;
 using Bicep.Core.Parsing;
 using Bicep.Core.Registry;
+using Bicep.Core.Resources;
 using Bicep.Core.Semantics;
 using Bicep.Core.Syntax;
 using Bicep.Core.TypeSystem;
@@ -22,7 +23,8 @@ using Bicep.Core.Workspaces;
 using Microsoft.Tye;
 using Microsoft.Tye.ConfigModel;
 using Microsoft.Tye.Hosting;
-using Microsoft.Tye.Hosting.Dashboard;
+using ObjectType = Bicep.Core.TypeSystem.ObjectType;
+using ResourceType = Bicep.Core.TypeSystem.ResourceType;
 
 namespace Boop.Cli
 {
@@ -443,44 +445,39 @@ namespace Boop.Cli
             {
                 if (descendant is ResourceSymbol resourceSymbol)
                 {
-                    ResourceSymbol appResource = null;
-                    string path = null;
+                    var reference = resourceSymbol.TryGetResourceTypeReference();
+                    if (!BoopResourceProvider.IsAppType(reference))
+                    {
+                        continue;
+                    }
+
                     List<RegisteredAppResourceUsage> uses = new();
+                    var body = resourceSymbol.DeclaringResource.GetBody();
+                    var project = ((StringSyntax)body.SafeGetPropertyByName("project").Value).TryGetLiteralValue();
+                    var deployTo = ((VariableAccessSyntax)body.SafeGetPropertyByName("deployTo")?.Value);
 
-                    foreach (var decoratorSyntax in (resourceSymbol.DeclaringSyntax as ResourceDeclarationSyntax).Decorators)
+                    ResourceSymbol deployToResource = null;
+                    if (deployTo != null)
                     {
-                        if (decoratorSyntax.Expression is FunctionCallSyntax { Name: { IdentifierName: "app" } })
-                        {
-                            appResource = resourceSymbol;
-                            path = (decoratorSyntax.Arguments.Single().Expression as StringSyntax).TryGetLiteralValue();
-                        }
-                        if (decoratorSyntax.Expression is FunctionCallSyntax { Name: { IdentifierName: "uses" } })
-                        {
-                            var arguments = decoratorSyntax.Arguments.ToList();
-                            var name  = (arguments[0].Expression as VariableAccessSyntax).Name.IdentifierName;
-                            string[] roles = Array.Empty<string>();
-                            if (arguments.Count > 1)
-                            {
-                                roles = (arguments[1].Expression as StringSyntax).TryGetLiteralValue().Split(",");
-                            }
-                            uses.Add(new RegisteredAppResourceUsage(model.Root.GetDeclarationsByName(name).Single() as ResourceSymbol, roles));
-                        }
+                        deployToResource = model.Root.GetDeclarationsByName(deployTo.Name.IdentifierName).Single() as ResourceSymbol;
+                    }
+                    foreach (var usesItem in ((ArraySyntax)body.SafeGetPropertyByName("uses")?.Value)?.Items ?? Array.Empty<ArrayItemSyntax>())
+                    {
+                        var usesBody = (ObjectSyntax)usesItem.Value;
+                        var usesService = ((VariableAccessSyntax)usesBody.SafeGetPropertyByName("service").Value);
+                        var usesResource = model.Root.GetDeclarationsByName(usesService.Name.IdentifierName).Single() as ResourceSymbol;
+                        var usesRole = ((StringSyntax)usesBody.SafeGetPropertyByName("role")?.Value)?.TryGetLiteralValue()?.Split(",") ?? Array.Empty<string>();
+                        uses.Add(new RegisteredAppResourceUsage(usesResource, usesRole));
                     }
 
-                    if (appResource != null && path != null)
-                    {
-                        var isFunction = ((ObjectSyntax)appResource.DeclaringResource.Value).SafeGetPropertyByName("kind")?.Value is StringSyntax stringSyntax &&
-                                         stringSyntax.TryGetLiteralValue()?.StartsWith("function") is true;
-
-                        var isDocker = Path.GetFileName(path) == "Dockerfile";
-
-                        var appPath = Path.Combine(
-                            Path.GetDirectoryName(model.Root.FileUri.AbsolutePath),
-                            path);
-
-                        var name = appResource.Name.ToLower();
-                        yield return new RegisteredApp(appResource, name, appPath, isFunction, isDocker, uses.ToArray());
-                    }
+                    yield return new RegisteredApp(
+                        deployToResource,
+                        descendant.Name,
+                        project,
+                        BoopResourceProvider.SameReference(BoopResourceProvider.FunctionAppResource.TypeReference, reference),
+                        BoopResourceProvider.SameReference(BoopResourceProvider.DockerAppResource.TypeReference, reference),
+                        uses.ToArray()
+                    );
                 }
             }
         }
@@ -492,7 +489,7 @@ namespace Boop.Cli
             var fileResolver = new FileResolver();
             var workspace = new Workspace();
 
-            var resourceTypeProvider = AzResourceTypeProvider.CreateWithAzTypes();
+            var resourceTypeProvider = new BoopResourceProvider(AzResourceTypeProvider.CreateWithAzTypes());
             var moduleDispatcher = new ModuleDispatcher(new DefaultModuleRegistryProvider(fileResolver));
 
             var sourceFileGrouping = SourceFileGroupingBuilder.Build(fileResolver, moduleDispatcher, workspace, inputUri);
@@ -677,6 +674,70 @@ namespace Boop.Cli
         }
     }
 
+    public class BoopResourceProvider: IResourceTypeProvider
+    {
+        private readonly IResourceTypeProvider _resourceTypeProviderImplementation;
+
+        public static ObjectType AppBodyObjectType { get; } = new ObjectType(
+            "dotnetapp",
+            TypeSymbolValidationFlags.Default,
+            new[]
+            {
+                new TypeProperty("project", LanguageConstants.String, TypePropertyFlags.Required),
+                new TypeProperty("deployTo", LanguageConstants.ResourceRef),
+                new TypeProperty("uses", new TypedArrayType(
+                    new ObjectType("serviceReference", TypeSymbolValidationFlags.Default, new[]
+                    {
+                        new TypeProperty("service", LanguageConstants.ResourceRef, TypePropertyFlags.Required),
+                        new TypeProperty("role", LanguageConstants.String),
+                    }, null),
+                    TypeSymbolValidationFlags.Default
+                ))
+            },
+            null
+        );
+
+        public static ResourceType DotNetAppResource { get; } = new(new ResourceTypeReference("Boop", new []{ "dotnetapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
+        public static ResourceType DockerAppResource { get; } = new(new ResourceTypeReference("Boop", new []{ "dockerapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
+        public static ResourceType FunctionAppResource { get; } = new(new ResourceTypeReference("Boop", new []{ "functionapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
+
+        private static ResourceType[] _types = new[]
+        {
+            DotNetAppResource,
+            DockerAppResource,
+            FunctionAppResource
+        };
+
+        public BoopResourceProvider(IResourceTypeProvider resourceTypeProviderImplementation)
+        {
+            _resourceTypeProviderImplementation = resourceTypeProviderImplementation;
+        }
+
+        public ResourceType GetType(ResourceTypeReference reference, ResourceTypeGenerationFlags flags)
+        {
+            return _types.SingleOrDefault(t=>SameReference(reference, t.TypeReference)) ?? _resourceTypeProviderImplementation.GetType(reference, flags);
+        }
+
+        public bool HasType(ResourceTypeReference typeReference)
+        {
+            return _types.Any(t => SameReference(typeReference, t.TypeReference)) || _resourceTypeProviderImplementation.HasType(typeReference);
+        }
+
+        public IEnumerable<ResourceTypeReference> GetAvailableTypes()
+        {
+            return _types.Select(r => r.TypeReference).Concat(_resourceTypeProviderImplementation.GetAvailableTypes());
+        }
+
+        public static bool SameReference(ResourceTypeReference reference, ResourceTypeReference t)
+        {
+            return t.Namespace == reference.Namespace && t.TypesString == reference.TypesString;
+        }
+
+        public static bool IsAppType(ResourceTypeReference resourceTypeReference)
+        {
+            return _types.Any(t => SameReference(resourceTypeReference, t.TypeReference));
+        }
+    }
 
     internal record DeployedResource(ResourceSymbol Resource, string Id, string Name, JsonElement Properties);
 
