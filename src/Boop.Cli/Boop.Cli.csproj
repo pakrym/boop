@@ -6,6 +6,7 @@
     <ToolCommandName>boop</ToolCommandName>
     <PackageId>Pakrym.Boop</PackageId>
     <PackAsTool>true</PackAsTool>
+    <NoWarn>$(NoWarn);CS8632;CS8002</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

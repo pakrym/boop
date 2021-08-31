@@ -175,7 +175,10 @@ namespace Boop.Cli
             }
 
             var application = ApplicationFactory.CreateAsync(output, new FileInfo(input), configApplication).Result;
-            application.Registry = new ContainerRegistry(GetRegistry(deployedResources));
+            application.Registry = new ContainerRegistry(GetRegistry(deployedResources, out var registryResource));
+
+            AzCli.Run($"role assignment create --assignee {res.identityProfile.kubeletidentity.objectId} --role \"acrpull\" --scope {registryResource.Id}");
+            AzCli.Run($"aks get-credentials --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId}");
 
             ExecuteDeployAsync(output, application, "production", true, false).Wait();
 
@@ -184,7 +187,6 @@ namespace Boop.Cli
                 AssignIdentity(deployedResources, app, res.identityProfile.kubeletidentity.objectId, true);
             }
 
-            AzCli.Run($"role assignment create --assignee {res.identityProfile.kubeletidentity.objectId} --role \"acrpull\" --scope {deployedResource.Id}");
         }
 
         private static ConfigApplication BuildConfigApplication(string input, IEnumerable<RegisteredApp> apps, IList<DeployedResource> resources, SemanticModel model)
@@ -293,7 +295,7 @@ namespace Boop.Cli
             if (app.IsDocker)
             {
                 var workingDirectory = Path.GetDirectoryName(app.Path);
-                var registry = GetRegistry(deployedResources);
+                var registry = GetRegistry(deployedResources, out _);
 
                 var imageName = $"{registry}/{app.Name.ToLowerInvariant()}";
                 var tag = "latest";
@@ -332,13 +334,14 @@ namespace Boop.Cli
             Console.WriteLine($"{app.Path} published to {deployedResource.Id} view at http://{deployedResource.Properties.GetProperty("properties").GetProperty("hostNames")[0]}");
         }
 
-        private static string GetRegistry(IEnumerable<DeployedResource> deployedResources)
+        private static string GetRegistry(IEnumerable<DeployedResource> deployedResources, out DeployedResource registryResource)
         {
             foreach (var deployedResource in deployedResources)
             {
                 var resourceType = ((ResourceType)deployedResource.Resource.Type);
                 if (resourceType.TypeReference.FullyQualifiedType == "Microsoft.ContainerRegistry/registries")
                 {
+                    registryResource = deployedResource;
                     var registry = deployedResource.Properties.GetProperty("properties").GetProperty("loginServer").GetString();
                     AzCli.Run($"acr login -n {registry}");
                     return registry;
