@@ -9,7 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.CommandLine" Version="2.0.0-beta1.21308.1" />
+    <PackageReference Include="System.CommandLine" Version="2.0.0-beta1.20071.2" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.0.0" PrivateAssets="All" />
   </ItemGroup>
 
@@ -20,6 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\..\tye\src\shared\KubectlDetector.cs" Link="KubectlDetector.cs" />
     <None Include="ProjectEvaluation.targets" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

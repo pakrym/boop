@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.CommandLine;
@@ -63,40 +64,7 @@ namespace Boop.Cli
 
                     var model = GetSemanticModel(input);
 
-                    ConfigApplication app = new ConfigApplication
-                    {
-                        Name = Path.GetFileNameWithoutExtension(input).ToLower(),
-                        Source = new FileInfo(input)
-                    };
-
-                    var apps = GetApps(model);
-
-                    foreach (var modelApp in apps)
-                    {
-                        var service = new ConfigService()
-                        {
-                            Name = modelApp.Name
-                        };
-
-                        if (modelApp.IsFunction)
-                        {
-                            service.AzureFunction = Path.GetDirectoryName(modelApp.Path);
-                        }
-                        else if (modelApp.IsDocker)
-                        {
-                            service.DockerFile = modelApp.Path;
-                            service.Bindings.Add(new ConfigServiceBinding()
-                            {
-                                Protocol = "http",
-                                ContainerPort = 80
-                            });
-                        }
-                        else
-                        {
-                            service.Project = modelApp.Path;
-                        }
-                        app.Services.Add(service);
-                    }
+                    var app = BuildConfigApplication(input, GetApps(model), null, model);
 
                     var application = await ApplicationFactory.CreateAsync(output, new FileInfo(input), app, args.Framework, filter);
                     if (application.Services.Count == 0)
@@ -132,16 +100,34 @@ namespace Boop.Cli
 
             var deployCommand = new Command("deploy")
             {
-                Handler = CommandHandler.Create(() =>
+                Handler = CommandHandler.Create<DeployCommandArguments>((args) =>
                 {
                     var input = GetInput();
                     var env = EnsureEnvironment();
                     var model = DeployResources(env, input, out var resourceMap);
 
-                    foreach (var app in GetApps(model))
+                    foreach (var app in GetApps(model).GroupBy(app => app.Resource))
                     {
-                        var settings = CollectSettings(app, resourceMap);
-                        DeployApp(env, app, resourceMap, settings);
+                        if (app.Key == null)
+                        {
+                            continue;
+                        }
+
+                        var output = new OutputContext(args.Console, args.Verbosity);
+                        var resourceType = ((ResourceType)app.Key.Type).TypeReference.FullyQualifiedType;
+                        if (resourceType == "Microsoft.ContainerService/managedClusters")
+                        {
+                            DeployAKS(input, env, app, resourceMap, output, model);
+                        }
+                        else
+                        {
+                            if (app.Count() > 1)
+                            {
+                                throw new InvalidOperationException($"Can't deploy multiple apps to {resourceType}");
+                            }
+
+                            DeploySingleApp(env, app.Single(), resourceMap, CollectSettings(app.Single(), resourceMap));
+                        }
                     }
                 })
             };
@@ -169,6 +155,89 @@ namespace Boop.Cli
             };
 
             return await rootCommand.InvokeAsync(args);
+        }
+
+        private static void DeployAKS(string input, BoopEnvironment env, IEnumerable<RegisteredApp> apps, List<DeployedResource> deployedResources, OutputContext output, SemanticModel model)
+        {
+            var deployedResource = deployedResources.Single(r => r.Resource.Name == apps.First().Resource.Name);
+
+            var res = AzCli.Run<AksResource>($"aks show --resource-group {env.Name} --name {deployedResource.Name} --subscription {env.SubscriptionId}");
+
+            var configApplication = BuildConfigApplication(input, apps, deployedResources, model);
+
+            foreach (var service in configApplication.Services)
+            {
+                service.Configuration.Add(new ConfigConfigurationSource()
+                {
+                    Name = "AZURE_CLIENT_ID",
+                    Value = res.identityProfile.kubeletidentity.clientId
+                });
+            }
+
+            var application = ApplicationFactory.CreateAsync(output, new FileInfo(input), configApplication).Result;
+            application.Registry = new ContainerRegistry(GetRegistry(deployedResources));
+
+            ExecuteDeployAsync(output, application, "production", true, false).Wait();
+
+            foreach (var app in apps)
+            {
+                AssignIdentity(deployedResources, app, res.identityProfile.kubeletidentity.objectId, true);
+            }
+
+            AzCli.Run($"role assignment create --assignee {res.identityProfile.kubeletidentity.objectId} --role \"acrpull\" --scope {deployedResource.Id}");
+        }
+
+        private static ConfigApplication BuildConfigApplication(string input, IEnumerable<RegisteredApp> apps, IList<DeployedResource> resources, SemanticModel model)
+        {
+            ConfigApplication app = new ConfigApplication
+            {
+                Name = Path.GetFileNameWithoutExtension(input).ToLower(),
+                Source = new FileInfo(input)
+            };
+
+            foreach (var modelApp in apps)
+            {
+                var service = new ConfigService()
+                {
+                    Name = modelApp.Name
+                };
+
+                if (modelApp.IsFunction)
+                {
+                    service.AzureFunction = Path.GetDirectoryName(modelApp.Path);
+                }
+                else if (modelApp.IsDocker)
+                {
+                    service.DockerFile = modelApp.Path;
+                    service.Bindings.Add(new ConfigServiceBinding()
+                    {
+                        Protocol = "http",
+                        ContainerPort = 80
+                    });
+                }
+                else
+                {
+                    service.Project = modelApp.Path;
+                }
+
+                if (resources != null)
+                {
+                    foreach (var setting in CollectSettings(modelApp, resources))
+                    {
+                        service.Configuration.Add(new ConfigConfigurationSource()
+                        {
+                            Name = setting.Key.Replace(":", "__"),
+                            Value =  setting.Value
+                        });
+                    }
+                }
+
+                app.Services.Add(service);
+            }
+
+            app.Ingress = GetIngress(model).ToList();
+
+            return app;
         }
 
         private static SemanticModel DeployResources(BoopEnvironment env, string input, out List<DeployedResource> resourceMap)
@@ -218,17 +287,13 @@ namespace Boop.Cli
             }
         }
 
-        private static void DeployApp(BoopEnvironment env, RegisteredApp app, IEnumerable<DeployedResource> deployedResources, Dictionary<string, string> settings)
+        private static void DeploySingleApp(BoopEnvironment env, RegisteredApp app, IEnumerable<DeployedResource> deployedResources, Dictionary<string, string> settings)
         {
             var deployedResource = deployedResources.Single(r => r.Resource.Name == app.Resource.Name);
             if (app.IsDocker)
             {
                 var workingDirectory = Path.GetDirectoryName(app.Path);
-                var registry = GetRegistry(deployedResources, out bool isAcr);
-                if (isAcr)
-                {
-                    AzCli.Run($"acr login -n {registry}");
-                }
+                var registry = GetRegistry(deployedResources);
 
                 var imageName = $"{registry}/{app.Name.ToLowerInvariant()}";
                 var tag = "latest";
@@ -267,16 +332,16 @@ namespace Boop.Cli
             Console.WriteLine($"{app.Path} published to {deployedResource.Id} view at http://{deployedResource.Properties.GetProperty("properties").GetProperty("hostNames")[0]}");
         }
 
-        private static string GetRegistry(IEnumerable<DeployedResource> deployedResources, out bool isAcr)
+        private static string GetRegistry(IEnumerable<DeployedResource> deployedResources)
         {
-            isAcr = true;
-
             foreach (var deployedResource in deployedResources)
             {
                 var resourceType = ((ResourceType)deployedResource.Resource.Type);
                 if (resourceType.TypeReference.FullyQualifiedType == "Microsoft.ContainerRegistry/registries")
                 {
-                    return deployedResource.Properties.GetProperty("properties").GetProperty("loginServer").GetString();
+                    var registry = deployedResource.Properties.GetProperty("properties").GetProperty("loginServer").GetString();
+                    AzCli.Run($"acr login -n {registry}");
+                    return registry;
                 }
             }
 
@@ -355,7 +420,7 @@ namespace Boop.Cli
             Dictionary<string, string> settings)
         {
             Console.WriteLine("Assigning roles and settings");
-            var res = AzCli.Run<WebAppIdentity>($"webapp identity assign --resource-group {env.Name} --name {appResource.Name} --subscription {env.SubscriptionId}");
+            var res = AzCli.Run<ResourceIdentity>($"webapp identity assign --resource-group {env.Name} --name {appResource.Name} --subscription {env.SubscriptionId}");
 
             AssignIdentity(deployedResources, app, res.principalId, true);
 
@@ -437,6 +502,44 @@ namespace Boop.Cli
         private static void WriteEnvironment(BoopEnvironment environment)
         {
             File.WriteAllText(GetProfilePath(), JsonSerializer.Serialize(environment));
+        }
+
+        private static IEnumerable<ConfigIngress> GetIngress(SemanticModel model)
+        {
+            foreach (var descendant in model.Root.Descendants)
+            {
+                if (descendant is ResourceSymbol resourceSymbol)
+                {
+                    var reference = resourceSymbol.TryGetResourceTypeReference();
+                    if (!BoopResourceProvider.SameReference(reference, BoopResourceProvider.IngressResource.TypeReference))
+                    {
+                        continue;
+                    }
+
+                    var result = new ConfigIngress()
+                    {
+                        Name = resourceSymbol.Name
+                    };
+
+                    var body = resourceSymbol.DeclaringResource.GetBody();
+                    foreach (var usesItem in ((ArraySyntax)body.SafeGetPropertyByName("endpoints")?.Value)?.Items ?? Array.Empty<ArrayItemSyntax>())
+                    {
+                        var endpointItem = (ObjectSyntax)usesItem.Value;
+                        var usesService = ((VariableAccessSyntax)endpointItem.SafeGetPropertyByName("app").Value);
+
+                        var path = ((StringSyntax)endpointItem.SafeGetPropertyByName("path")?.Value)?.TryGetLiteralValue();
+
+                        result.Rules.Add(new ConfigIngressRule()
+                        {
+                            Service = usesService.Name.IdentifierName,
+                            Path = path
+                        });
+                    }
+
+                    yield return result;
+                }
+            }
+
         }
 
         private static IEnumerable<RegisteredApp> GetApps(SemanticModel model)
@@ -640,6 +743,76 @@ namespace Boop.Cli
             // We use serviceCount * 4 because we currently launch multiple processes per service, this gives the dashboard some breathing room
         }
 
+        private static async Task ExecuteDeployAsync(OutputContext output, ApplicationBuilder application, string environment, bool interactive, bool force)
+        {
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+
+            if (await KubectlDetector.GetKubernetesServerVersion(output) == null)
+            {
+                throw new CommandException($"Cannot apply manifests because kubectl is not installed.");
+            }
+
+            if (!await KubectlDetector.IsKubectlConnectedToClusterAsync(output))
+            {
+                throw new CommandException($"Cannot apply manifests because kubectl is not connected to a cluster.");
+            }
+
+            ApplyRegistry(output, application, interactive, requireRegistry: true);
+
+            var executor = new ApplicationExecutor(output)
+            {
+                ServiceSteps =
+                {
+                    new ApplyContainerDefaultsStep(),
+                    new CombineStep() { Environment = environment, },
+                    new PublishProjectStep(),
+                    new BuildDockerImageStep() { Environment = environment, },
+                    new PushDockerImageStep() { Environment = environment, },
+                    new ValidateSecretStep() { Environment = environment, Interactive = interactive, Force = force, },
+                    new GenerateServiceKubernetesManifestStep() { Environment = environment, },
+                },
+
+                IngressSteps =
+                {
+                    new ValidateIngressStep() { Environment = environment, Interactive = interactive, Force = force, },
+                    new GenerateIngressKubernetesManifestStep(),
+                },
+
+                ApplicationSteps =
+                {
+                    new DeployApplicationKubernetesManifestStep(),
+                }
+            };
+
+            await executor.ExecuteAsync(application);
+
+            watch.Stop();
+
+            TimeSpan elapsedTime = watch.Elapsed;
+
+            output.WriteAlwaysLine($"Time Elapsed: {elapsedTime.Hours:00}:{elapsedTime.Minutes:00}:{elapsedTime.Seconds:00}:{elapsedTime.Milliseconds / 10:00}");
+        }
+
+        internal static void ApplyRegistry(OutputContext output, ApplicationBuilder application, bool interactive, bool requireRegistry)
+        {
+            if (application.Registry is null && interactive)
+            {
+                var registry = output.Prompt("Enter the Container Registry (ex: 'example.azurecr.io' for Azure or 'example' for dockerhub)", allowEmpty: !requireRegistry);
+                if (!string.IsNullOrWhiteSpace(registry))
+                {
+                    application.Registry = new ContainerRegistry(registry.Trim());
+                }
+            }
+            else if (application.Registry is null && requireRegistry)
+            {
+                throw new CommandException("A registry is required for deploy operations. Add the registry to 'tye.yaml' or use '-i' for interactive mode.");
+            }
+            else
+            {
+                // No registry specified, and that's OK!
+            }
+        }
+
         // We have too many options to use the lambda form with each option as a parameter.
         // This is slightly cleaner anyway.
         private class RunCommandArguments
@@ -674,6 +847,24 @@ namespace Boop.Cli
         }
     }
 
+    internal class DeployCommandArguments
+    {
+        public IConsole Console { get; set; } = default!;
+
+        public FileInfo Path { get; set; } = default!;
+
+        public Verbosity Verbosity { get; set; } = Verbosity.Info;
+
+        public string Namespace { get; set; } = default!;
+
+        public bool Interactive { get; set; } = false;
+
+        public string Framework { get; set; } = default!;
+
+        public bool Force { get; set; } = false;
+
+        public string[] Tags { get; set; } = Array.Empty<string>();
+    }
     public class BoopResourceProvider: IResourceTypeProvider
     {
         private readonly IResourceTypeProvider _resourceTypeProviderImplementation;
@@ -697,16 +888,36 @@ namespace Boop.Cli
             null
         );
 
+        public static ObjectType IngressObjectType { get; } = new ObjectType(
+            "ingress",
+            TypeSymbolValidationFlags.Default,
+            new[]
+            {
+                new TypeProperty("endpoints", new TypedArrayType(
+                    new ObjectType("endpoint", TypeSymbolValidationFlags.Default, new[]
+                    {
+                        new TypeProperty("app", LanguageConstants.ResourceRef, TypePropertyFlags.Required),
+                        new TypeProperty("path", LanguageConstants.String),
+                    }, null),
+                    TypeSymbolValidationFlags.Default
+                ))
+            },
+            null
+        );
+
         public static ResourceType DotNetAppResource { get; } = new(new ResourceTypeReference("Boop", new []{ "dotnetapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
         public static ResourceType DockerAppResource { get; } = new(new ResourceTypeReference("Boop", new []{ "dockerapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
         public static ResourceType FunctionAppResource { get; } = new(new ResourceTypeReference("Boop", new []{ "functionapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
+        public static ResourceType IngressResource { get; } = new(new ResourceTypeReference("Boop", new []{ "ingress" }, "v1"), ResourceScope.Module, IngressObjectType);
 
-        private static ResourceType[] _types = new[]
+        private static ResourceType[] _appTypes = new[]
         {
             DotNetAppResource,
             DockerAppResource,
             FunctionAppResource
         };
+
+        private static ResourceType[] _allTypes = _appTypes.Concat(new [] { IngressResource }).ToArray();
 
         public BoopResourceProvider(IResourceTypeProvider resourceTypeProviderImplementation)
         {
@@ -715,17 +926,17 @@ namespace Boop.Cli
 
         public ResourceType GetType(ResourceTypeReference reference, ResourceTypeGenerationFlags flags)
         {
-            return _types.SingleOrDefault(t=>SameReference(reference, t.TypeReference)) ?? _resourceTypeProviderImplementation.GetType(reference, flags);
+            return _allTypes.SingleOrDefault(t=>SameReference(reference, t.TypeReference)) ?? _resourceTypeProviderImplementation.GetType(reference, flags);
         }
 
         public bool HasType(ResourceTypeReference typeReference)
         {
-            return _types.Any(t => SameReference(typeReference, t.TypeReference)) || _resourceTypeProviderImplementation.HasType(typeReference);
+            return _allTypes.Any(t => SameReference(typeReference, t.TypeReference)) || _resourceTypeProviderImplementation.HasType(typeReference);
         }
 
         public IEnumerable<ResourceTypeReference> GetAvailableTypes()
         {
-            return _types.Select(r => r.TypeReference).Concat(_resourceTypeProviderImplementation.GetAvailableTypes());
+            return _appTypes.Select(r => r.TypeReference).Concat(_resourceTypeProviderImplementation.GetAvailableTypes());
         }
 
         public static bool SameReference(ResourceTypeReference reference, ResourceTypeReference t)
@@ -735,7 +946,7 @@ namespace Boop.Cli
 
         public static bool IsAppType(ResourceTypeReference resourceTypeReference)
         {
-            return _types.Any(t => SameReference(resourceTypeReference, t.TypeReference));
+            return _appTypes.Any(t => SameReference(resourceTypeReference, t.TypeReference));
         }
     }
 
@@ -743,7 +954,11 @@ namespace Boop.Cli
 
     internal record RegisteredAppResourceUsage(ResourceSymbol Resource, string[] Roles);
 
-    internal record WebAppIdentity(string principalId);
+    internal record ResourceIdentity(string principalId);
+
+    internal record AksResource(ResourceIdentity identity, AksResourceIdentityProfile identityProfile);
+    internal record AksResourceIdentityProfile(KubeletIdentity kubeletidentity);
+    internal record KubeletIdentity(string objectId, string clientId);
 
     internal record RegisteredApp(ResourceSymbol Resource, string Name, string Path, bool IsFunction, bool IsDocker, RegisteredAppResourceUsage[] Uses);
 
