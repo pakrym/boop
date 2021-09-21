@@ -310,12 +310,8 @@ namespace Boop.Cli
             }
             else
             {
-                var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
 
-                Exec.Run("dotnet", $"publish -c Release {app.Path} -o {tempDir}");
-
-                var destinationArchiveFileName = Path.GetTempFileName() + ".zip";
-                ZipFile.CreateFromDirectory(tempDir, destinationArchiveFileName);
+                var destinationArchiveFileName = BuildAndPackSingleApp(app);
 
                 if (app.IsFunction)
                 {
@@ -332,6 +328,27 @@ namespace Boop.Cli
             AssignRolesAndSettings(env, deployedResources, app, deployedResource, settings);
 
             Console.WriteLine($"{app.Path} published to {deployedResource.Id} view at http://{deployedResource.Properties.GetProperty("properties").GetProperty("hostNames")[0]}");
+        }
+
+        private static string BuildAndPackSingleApp(RegisteredApp app)
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+            var destinationArchiveFileName = Path.GetTempFileName() + ".zip";
+
+            if (app.Runtime == AppRuntimeType.Dotnet)
+            {
+                Exec.Run("dotnet", $"publish -c Release {app.Path} -o {tempDir}");
+            }
+            else if (app.Runtime == AppRuntimeType.NodeJs)
+            {
+                var appPackageRoot = Path.GetDirectoryName(app.Path);
+                Exec.Run("cmd", "/c npm run-script --if-present build", appPackageRoot);
+                tempDir = appPackageRoot;
+            }
+
+            ZipFile.CreateFromDirectory(tempDir, destinationArchiveFileName);
+
+            return destinationArchiveFileName;
         }
 
         private static string GetRegistry(IEnumerable<DeployedResource> deployedResources, out DeployedResource registryResource)
@@ -368,10 +385,18 @@ namespace Boop.Cli
             }
             else
             {
-                Exec.Run("dotnet", "user-secrets init", workingDirectory);
-                foreach (var setting in settings)
+                if (app.Runtime == AppRuntimeType.Dotnet)
                 {
-                    Exec.Run("dotnet", $"user-secrets set {setting.Key} {setting.Value}", workingDirectory);
+                    Exec.Run("dotnet", "user-secrets init", workingDirectory);
+                    foreach (var setting in settings)
+                    {
+                        Exec.Run("dotnet", $"user-secrets set {setting.Key} {setting.Value}", workingDirectory);
+                    }
+                }
+                else if (app.Runtime == AppRuntimeType.NodeJs)
+                {
+                    var envFile = Path.Combine(workingDirectory, ".env");
+                    File.WriteAllLines(envFile, settings.Select(s => $"{s.Key.Replace(":", "__")}={s.Value}"));
                 }
             }
         }
@@ -576,10 +601,13 @@ namespace Boop.Cli
                         uses.Add(new RegisteredAppResourceUsage(usesResource, usesRole));
                     }
 
+                    var runtimeType = !BoopResourceProvider.SameReference(BoopResourceProvider.NodeJsAppResource.TypeReference, reference) ? AppRuntimeType.Dotnet : AppRuntimeType.NodeJs;
+
                     yield return new RegisteredApp(
                         deployToResource,
                         descendant.Name,
                         project,
+                        runtimeType,
                         BoopResourceProvider.SameReference(BoopResourceProvider.FunctionAppResource.TypeReference, reference),
                         BoopResourceProvider.SameReference(BoopResourceProvider.DockerAppResource.TypeReference, reference),
                         uses.ToArray()
@@ -909,6 +937,7 @@ namespace Boop.Cli
         );
 
         public static ResourceType DotNetAppResource { get; } = new(new ResourceTypeReference("Boop", new []{ "dotnetapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
+        public static ResourceType NodeJsAppResource { get; } = new(new ResourceTypeReference("Boop", new[] { "nodejsapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
         public static ResourceType DockerAppResource { get; } = new(new ResourceTypeReference("Boop", new []{ "dockerapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
         public static ResourceType FunctionAppResource { get; } = new(new ResourceTypeReference("Boop", new []{ "functionapp" }, "v1"), ResourceScope.Module, AppBodyObjectType);
         public static ResourceType IngressResource { get; } = new(new ResourceTypeReference("Boop", new []{ "ingress" }, "v1"), ResourceScope.Module, IngressObjectType);
@@ -916,6 +945,7 @@ namespace Boop.Cli
         private static ResourceType[] _appTypes = new[]
         {
             DotNetAppResource,
+            NodeJsAppResource,
             DockerAppResource,
             FunctionAppResource
         };
@@ -963,7 +993,13 @@ namespace Boop.Cli
     internal record AksResourceIdentityProfile(KubeletIdentity kubeletidentity);
     internal record KubeletIdentity(string objectId, string clientId);
 
-    internal record RegisteredApp(ResourceSymbol Resource, string Name, string Path, bool IsFunction, bool IsDocker, RegisteredAppResourceUsage[] Uses);
+    internal enum AppRuntimeType
+    {
+        Dotnet,
+        NodeJs,
+    }
+
+    internal record RegisteredApp(ResourceSymbol Resource, string Name, string Path, AppRuntimeType Runtime, bool IsFunction, bool IsDocker, RegisteredAppResourceUsage[] Uses);
 
     internal record BoopEnvironment(string SubscriptionId, string Name, string UserName);
 }
